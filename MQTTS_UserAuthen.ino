@@ -1,40 +1,37 @@
+
 #include <WiFi.h>
+#include <WiFiClient.h>
 #include <WiFiClientSecure.h>
 #include "mqtt_client.h"
 #include <time.h>
 #include <DHT.h>
 #include <Arduino_JSON.h>
+#include <string.h>
+#include <stdio.h>
 #include "env.h"
 
 // ============================================================
 // 1. WIFI CONFIGURATION
 // ============================================================
 
-//const char *ssid     = "Your Wifi SSID";
-//const char *password = "Your Wifi Password";
-
 // ============================================================
 // 2. MQTT CONFIGURATION
 // ============================================================
 
-//const char *mqtt_host     = "vps0xx.dsel.duckdns.org";
-const int   mqtt_port     = 8883;
-
-//const char *mqtt_username = "Your MQTT Username";
-//const char *mqtt_password = "Your MQTT password";
+const int mqtt_port = 8883;
 
 const char *mqtt_topic         = "esp32/command";
 const char *mqtt_publish_topic = "esp32/sensor";
+
+// MQTT URI is constructed from env.h
+// Do not hardcode broker hostname here.
+char mqtt_uri[192];
 
 // ============================================================
 // 3. TLS CERTIFICATE
 // ============================================================
 
-// const char *test_certificate = R"EOF(        // อย่าลืมเอาเครื่องหมาย //ข้างหน้าทุกบรรทัด เริ่มจากบรรทัดนี้ออก
-//-----BEGIN CERTIFICATE-----
-// put your ca.crt here  วางข้อมูล ca.crt ไว้ตรงนี้  
-//-----END CERTIFICATE-----
-//)EOF";                                       //  อย่าลืมเอาเครื่องหมาย //ข้างหน้าทุกบรรทัด ถึงตรงนี้ัออก
+// test_certificate is defined in env.h
 
 // ============================================================
 // 4. NTP CONFIGURATION
@@ -46,7 +43,7 @@ const long gmtOffset_sec = 7 * 3600;
 const int daylightOffset_sec = 0;
 
 // ============================================================
-// 5. HARDWARE, DHT22 & GLOBAL VARIABLES
+// 5. HARDWARE & GLOBAL VARIABLES
 // ============================================================
 
 #define LED_PIN 2
@@ -101,7 +98,6 @@ bool testWiFi() {
     if (WiFi.status() != WL_CONNECTED) {
 
         Serial.println("\n[FAIL] WiFi Connection");
-
         return false;
     }
 
@@ -177,22 +173,33 @@ bool testDNS() {
 
     IPAddress brokerIP;
 
-    if (WiFi.hostByName(mqtt_host, brokerIP)) {
+    Serial.print("Resolving : ");
+    Serial.println(mqtt_host);
 
-        Serial.println("[PASS] DNS Resolution");
+    if (!WiFi.hostByName(mqtt_host, brokerIP)) {
 
-        Serial.print("Domain : ");
-        Serial.println(mqtt_host);
+        Serial.println("[FAIL] DNS Resolution");
+        Serial.println("DNS lookup failed.");
 
-        Serial.print("IP     : ");
-        Serial.println(brokerIP);
-
-        return true;
+        return false;
     }
 
-    Serial.println("[FAIL] DNS Resolution");
+    if (brokerIP == IPAddress(0, 0, 0, 0)) {
 
-    return false;
+        Serial.println("[FAIL] DNS returned 0.0.0.0");
+
+        return false;
+    }
+
+    Serial.println("[PASS] DNS Resolution");
+
+    Serial.print("Domain : ");
+    Serial.println(mqtt_host);
+
+    Serial.print("IP     : ");
+    Serial.println(brokerIP);
+
+    return true;
 }
 
 // ============================================================
@@ -268,7 +275,8 @@ bool testTLS() {
 }
 
 // ============================================================
-// HANDLE COMMAND PAYLOAD ("led": 0 หรือ 1) WITH Arduino_JSON
+// HANDLE COMMAND PAYLOAD
+// JSON: {"led": 0} or {"led": 1}
 // ============================================================
 
 void handleCommandMessage(const char *data, int data_len) {
@@ -281,12 +289,16 @@ void handleCommandMessage(const char *data, int data_len) {
     }
 
     char jsonBuf[512];
+
     memcpy(jsonBuf, data, data_len);
     jsonBuf[data_len] = '\0';
 
     JSONVar doc = JSON.parse(jsonBuf);
 
-    if (JSON.typeof(doc) == "undefined" || !doc.hasOwnProperty("led")) {
+    if (
+        JSON.typeof(doc) == "undefined" ||
+        !doc.hasOwnProperty("led")
+    ) {
 
         Serial.println("[WARN] Invalid JSON or missing 'led' property");
 
@@ -294,19 +306,23 @@ void handleCommandMessage(const char *data, int data_len) {
     }
 
     int ledVal = -1;
+
     JSONVar ledVar = doc["led"];
     String ledType = JSON.typeof(ledVar);
 
     if (ledType == "number") {
 
         ledVal = (int)ledVar;
+
     } else if (ledType == "string") {
 
         String sVal = (String)ledVar;
         sVal.trim();
+
         if (sVal == "1") {
 
             ledVal = 1;
+
         } else if (sVal == "0") {
 
             ledVal = 0;
@@ -315,14 +331,22 @@ void handleCommandMessage(const char *data, int data_len) {
 
     if (ledVal != 0 && ledVal != 1) {
 
-        Serial.printf("[WARN] Invalid 'led' value in payload: %s\n", jsonBuf);
+        Serial.printf(
+            "[WARN] Invalid 'led' value: %s\n",
+            jsonBuf
+        );
 
         return;
     }
 
     digitalWrite(LED_PIN, ledVal == 1 ? HIGH : LOW);
 
-    Serial.printf("[LED] GPIO %d -> %s (led=%d)\n", LED_PIN, ledVal == 1 ? "HIGH" : "LOW", ledVal);
+    Serial.printf(
+        "[LED] GPIO %d -> %s (led=%d)\n",
+        LED_PIN,
+        ledVal == 1 ? "HIGH" : "LOW",
+        ledVal
+    );
 }
 
 // ============================================================
@@ -350,10 +374,15 @@ static void mqtt_event_handler(
         case MQTT_EVENT_CONNECTED:
 
             mqtt_connected = true;
+            mqtt_subscribed = false;
+            mqtt_timeout_reported = false;
 
             Serial.println();
             Serial.println("[PASS] MQTT CONNECTED");
             Serial.println("[PASS] MQTT Authentication Accepted");
+
+            Serial.print("Broker : ");
+            Serial.println(mqtt_host);
 
             Serial.print("Subscribe Topic: ");
             Serial.println(mqtt_topic);
@@ -413,10 +442,17 @@ static void mqtt_event_handler(
 
             if (
                 event->topic_len == (int)strlen(mqtt_topic) &&
-                strncmp(event->topic, mqtt_topic, event->topic_len) == 0
+                strncmp(
+                    event->topic,
+                    mqtt_topic,
+                    event->topic_len
+                ) == 0
             ) {
 
-                handleCommandMessage(event->data, event->data_len);
+                handleCommandMessage(
+                    event->data,
+                    event->data_len
+                );
             }
 
             break;
@@ -472,10 +508,8 @@ static void mqtt_event_handler(
 
             Serial.println("================================");
 
-            if (event->client != NULL) {
-
-                esp_mqtt_client_reconnect(event->client);
-            }
+            // ESP-MQTT handles automatic reconnection.
+            // Do not call esp_mqtt_client_reconnect() here.
 
             break;
         }
@@ -499,10 +533,49 @@ void testMQTT() {
 
     printSection("MQTT AUTHENTICATION");
 
+    // Validate MQTT hostname
+
+    if (
+        mqtt_host == NULL ||
+        strlen(mqtt_host) == 0 ||
+        strstr(mqtt_host, "://") != NULL
+    ) {
+
+        Serial.println("[FAIL] Invalid MQTT Hostname");
+
+        Serial.println(
+            "Use hostname only, without mqtts://"
+        );
+
+        return;
+    }
+
+    // Construct MQTT URI from env.h
+
+    int uriLength = snprintf(
+        mqtt_uri,
+        sizeof(mqtt_uri),
+        "mqtts://%s:%d",
+        mqtt_host,
+        mqtt_port
+    );
+
+    if (
+        uriLength <= 0 ||
+        uriLength >= (int)sizeof(mqtt_uri)
+    ) {
+
+        Serial.println("[FAIL] MQTT URI Construction");
+
+        return;
+    }
+
+    Serial.print("MQTT URI : ");
+    Serial.println(mqtt_uri);
+
     esp_mqtt_client_config_t mqtt_cfg = {};
 
-    mqtt_cfg.broker.address.uri =
-        "mqtts://easyfarm.duckdns.org:8883";
+    mqtt_cfg.broker.address.uri = mqtt_uri;
 
     mqtt_cfg.broker.verification.certificate =
         test_certificate;
@@ -547,6 +620,12 @@ void testMQTT() {
 
     Serial.println("Starting MQTT Client...");
 
+    mqtt_connected = false;
+    mqtt_subscribed = false;
+    mqtt_timeout_reported = false;
+
+    mqtt_start_time = millis();
+
     esp_err_t result =
         esp_mqtt_client_start(mqtt_client);
 
@@ -557,10 +636,10 @@ void testMQTT() {
             esp_err_to_name(result)
         );
 
+        mqtt_start_time = 0;
+
         return;
     }
-
-    mqtt_start_time = millis();
 
     Serial.println("[PASS] MQTT Client Started");
     Serial.println("Waiting for Broker...");
@@ -582,14 +661,18 @@ void publishSensorData() {
 
     if (isnan(humi) || isnan(temp)) {
 
-        Serial.println("[WARN] Failed to read from DHT22 sensor");
+        Serial.println(
+            "[WARN] Failed to read from DHT22 sensor"
+        );
 
         return;
     }
 
     JSONVar payloadObj;
+
     payloadObj["humidity"] = humi;
     payloadObj["temperature"] = temp;
+
     String jsonStr = JSON.stringify(payloadObj);
 
     int msg_id = esp_mqtt_client_publish(
@@ -609,6 +692,7 @@ void publishSensorData() {
             jsonStr.c_str(),
             msg_id
         );
+
     } else {
 
         Serial.println("[FAIL] MQTT Publish failed");
@@ -622,20 +706,27 @@ void publishSensorData() {
 void setup() {
 
     Serial.begin(115200);
+
     pinMode(LED_PIN, OUTPUT);
     digitalWrite(LED_PIN, LOW);
+
     dht.begin();
 
     delay(1000);
 
     Serial.println();
     Serial.println();
+
     esp_log_level_set("periph_ctrl", ESP_LOG_ERROR);
+
     Serial.println("############################################");
     Serial.println("#       ESP32 MQTTS DIAGNOSTIC TOOL         #");
-    Serial.println("#       EASYFARM MQTT BROKER                #");
+    Serial.println("#       MQTT BROKER DIAGNOSTIC              #");
     Serial.println("#       ARDUINO ESP32 CORE 3.3.12           #");
     Serial.println("############################################");
+
+    Serial.print("Configured Broker: ");
+    Serial.println(mqtt_host);
 
     // TEST 1: WIFI
 
@@ -657,17 +748,39 @@ void setup() {
 
     // TEST 3: DNS
 
-    testDNS();
+    bool dnsResult = testDNS();
 
     // TEST 4: TCP
 
-    testTCP();
+    bool tcpResult = testTCP();
 
     // TEST 5: TLS
 
-    testTLS();
+    bool tlsResult = testTLS();
+
+    Serial.println();
+    Serial.println("========== NETWORK DIAGNOSTIC SUMMARY ==========");
+
+    Serial.printf(
+        "DNS : %s\n",
+        dnsResult ? "PASS" : "FAIL"
+    );
+
+    Serial.printf(
+        "TCP : %s\n",
+        tcpResult ? "PASS" : "FAIL"
+    );
+
+    Serial.printf(
+        "TLS : %s\n",
+        tlsResult ? "PASS" : "FAIL"
+    );
+
+    Serial.println("================================================");
 
     // TEST 6: MQTT
+    // Continue even if an earlier diagnostic fails.
+    // MQTT events will provide additional details.
 
     testMQTT();
 
@@ -705,14 +818,22 @@ void loop() {
         mqtt_timeout_reported = true;
 
         Serial.println();
-        Serial.println("[TIMEOUT] MQTT did not connect within 20 seconds");
+        Serial.println(
+            "[TIMEOUT] MQTT did not connect within 20 seconds"
+        );
 
         Serial.println("Check MQTT ERROR details above.");
     }
 
-    if (mqtt_connected && (millis() - lastPublishTime >= publishInterval)) {
+    // PUBLISH SENSOR DATA
+
+    if (
+        mqtt_connected &&
+        millis() - lastPublishTime >= publishInterval
+    ) {
 
         lastPublishTime = millis();
+
         publishSensorData();
     }
 
