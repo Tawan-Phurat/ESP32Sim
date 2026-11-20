@@ -17,7 +17,7 @@
 // 2. MQTT CONFIGURATION
 // ============================================================
 
-const char *mqtt_host     = "easyfarm.duckdns.org";
+//const char *mqtt_host     = "vps0xx.dsel.duckdns.org";
 const int   mqtt_port     = 8883;
 
 //const char *mqtt_username = "Your MQTT Username";
