@@ -247,7 +247,7 @@ void publishSensorData() {
 // ============================================================
 
 void setup() {
-
+    esp_log_level_set("periph_ctrl", ESP_LOG_ERROR);
     Serial.begin(115200);
 
     pinMode(LED_PIN, OUTPUT);
